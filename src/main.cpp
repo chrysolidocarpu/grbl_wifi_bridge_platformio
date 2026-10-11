@@ -6,6 +6,7 @@
 #include <memory>
 #include <cstdlib>
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -33,9 +34,16 @@ using namespace esp_usb;
 #define AP_CHANNEL   6
 #define TCP_PORT     23
 #define GRBL_BAUD    115200
-#define AIR_GPIO         4     // avoid 0,3,45,46 (strapping), 19/20 (USB), 26-32, 43/44
-#define AIR_ACTIVE_HIGH  1     // 1: GPIO high = air on
-#define AIR_M7_TOO       1     // also treat M7 as "air on"
+#define AIR_GPIO         4          // avoid 0,3,45,46 (strapping), 19/20 (USB), 26-32, 43/44
+#define AIR_PULSED_GPIO  5          // avoid 0,3,45,46 (strapping), 19/20 (USB), 26-32, 43/44
+#define AIR_PULSED_ACTIVE_HIGH  1   // 1: PWM high = MOSFET on
+#define M_CODE_AIRASSIST 7          // M7: Air Assist
+#define PULSE_FREQ_HZ    20000
+#define PULSE_RES_BITS   10
+#define PULSE_TARGET_DUTY_PCT 40    // M7 without S: duty reached at the end of the ramp
+#define PULSE_S_MAX      1000       // M7 Pn: n / PULSE_S_MAX = duty fraction
+#define PULSE_RAMP_MS    5000       // M7 ramp-up time
+#define AIR_ACTIVE_HIGH  1          // 1: GPIO high = air on
 // ---------------------------------------------------------------------------
 
 static const char *TAG = "grbl_bridge";
@@ -52,6 +60,70 @@ static inline void air_set(bool on)
     gpio_set_level((gpio_num_t)AIR_GPIO, (on == (AIR_ACTIVE_HIGH != 0)) ? 1 : 0);
 }
 
+static const uint32_t PULSE_MAX_DUTY = (1u << PULSE_RES_BITS) - 1;
+
+static uint32_t pulse_duty_raw(uint32_t pct)
+{
+    uint32_t d = PULSE_MAX_DUTY * pct / 100;
+    return AIR_PULSED_ACTIVE_HIGH ? d : PULSE_MAX_DUTY - d;
+}
+
+static void pulse_init()
+{
+    ledc_timer_config_t t = {};
+    t.speed_mode = LEDC_LOW_SPEED_MODE;
+    t.duty_resolution = (ledc_timer_bit_t)PULSE_RES_BITS;
+    t.timer_num = LEDC_TIMER_0;
+    t.freq_hz = PULSE_FREQ_HZ;
+    t.clk_cfg = LEDC_AUTO_CLK;
+    ledc_timer_config(&t);
+
+    ledc_channel_config_t c = {};
+    c.gpio_num = AIR_PULSED_GPIO;
+    c.speed_mode = LEDC_LOW_SPEED_MODE;
+    c.channel = LEDC_CHANNEL_0;
+    c.timer_sel = LEDC_TIMER_0;
+    c.duty = pulse_duty_raw(0);
+    ledc_channel_config(&c);
+    ledc_fade_func_install(0);
+}
+
+// Hardware fade from the current duty to pct over ms (0 = immediate).
+static void pulse_fade_to(uint32_t pct, uint32_t ms)
+{
+    ledc_set_fade_time_and_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0,
+                                 pulse_duty_raw(pct), ms ? ms : 1, LEDC_FADE_NO_WAIT);
+}
+
+static void pulse_start(uint32_t pct)
+{
+    pulse_fade_to(pct > 100 ? 100 : pct, PULSE_RAMP_MS);
+}
+
+// Returns the S word value on the line (ignoring comments), or -1 if absent.
+static long find_s_word(const char *line)
+{
+    bool in_paren = false;
+    for (const char *p = line; *p; ++p) {
+        char c = *p;
+        if (in_paren) { if (c == ')') in_paren = false; continue; }
+        if (c == '(') { in_paren = true; continue; }
+        if (c == ';') break;
+        if (c == 'S' || c == 's') {
+            char *end;
+            double v = strtod(p + 1, &end);
+            if (end != p + 1) return (long)v;
+        }
+    }
+    return -1;
+}
+
+static void pulse_stop()
+{
+    // ledc_stop leaves the pin at the idle level: off for either polarity
+    ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, AIR_PULSED_ACTIVE_HIGH ? 0 : 1);
+}
+
 static void air_init()
 {
     gpio_config_t io = {};
@@ -59,6 +131,14 @@ static void air_init()
     io.mode = GPIO_MODE_OUTPUT;
     gpio_config(&io);
     air_set(false);
+    pulse_init();
+    pulse_stop();
+}
+
+static void outputs_off()
+{
+    air_set(false);
+    pulse_stop();
 }
 
 static void handle_gcode_line(const char *line)
@@ -73,13 +153,22 @@ static void handle_gcode_line(const char *line)
             char *end;
             long v = strtol(p + 1, &end, 10);
             if (end == p + 1) continue;
-            if (v == 8 || (AIR_M7_TOO && v == 7)) {
+            if (v == 7) {
                 g_air_off_pending = false;
-                air_set(true);
-                ESP_LOGI(TAG, "Air assist ON");
+                long s = find_s_word(line);
+                uint32_t pct = PULSE_TARGET_DUTY_PCT;
+                if (s >= 0) pct = (uint32_t)(s > PULSE_S_MAX ? PULSE_S_MAX : s) * 1000 / PULSE_S_MAX;
+                pulse_start(pct);
+                ESP_LOGI(TAG, "Pulsed output ramping to %u%%", (unsigned)pct);
+            } else if (v == 8) {
+                g_air_off_pending = false;
+                uint32_t pct = 100;
+                pulse_start(pct);
+                ESP_LOGI(TAG, "Pulsed output ramping to max %u%%", (unsigned)pct);
             } else if (v == 9) {
                 g_air_off_pending = true;     // switch off once GRBL is idle
             }
+
             p = end - 1;
         }
     }
@@ -102,7 +191,7 @@ static void gcode_feed(const uint8_t *d, size_t n)
         uint8_t c = d[i];
         if (c == 0x18) {                       // GRBL soft reset: stop everything
             g_air_off_pending = false;
-            air_set(false);
+            outputs_off();
             gcode_reset();
             continue;
         }
@@ -132,8 +221,8 @@ static void scan_for_idle(const uint8_t *d, size_t n)
                 m = 0;
                 if (g_air_off_pending) {
                     g_air_off_pending = false;
-                    air_set(false);
-                    ESP_LOGI(TAG, "Air assist OFF");
+                    outputs_off();
+                    ESP_LOGI(TAG, "Outputs OFF");
                 }
             }
         } else {
@@ -151,8 +240,8 @@ static void usb_event_cb(const cdc_acm_host_dev_event_data_t *event, void *user_
         break;
     case CDC_ACM_HOST_DEVICE_DISCONNECTED:
         ESP_LOGW(TAG, "Laser unplugged");
-        g_air_off_pending = false;                 // <-- added
-        air_set(false);                            // <-- added
+        g_air_off_pending = false;
+        outputs_off();                             // <-- added
         xSemaphoreGive(g_disconnect_sem);
         break;
     default:
@@ -286,8 +375,8 @@ static void tcp_server_task(void *arg)
         }
 
         g_client = -1;
-        g_air_off_pending = false;                 // <-- added
-        air_set(false); 
+        g_air_off_pending = false;
+        outputs_off();
         close(fd);
         ESP_LOGI(TAG, "Client disconnected");
     }
