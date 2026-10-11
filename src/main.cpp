@@ -184,7 +184,55 @@ static void gcode_reset()
     g_line_overflow = false;
 }
 
-// Called with every byte block that goes client -> laser.
+static void forward_to_laser(const uint8_t *d, size_t n)
+{
+    if (!n) return;
+    xSemaphoreTake(g_vcp_lock, portMAX_DELAY);
+    if (g_vcp) g_vcp->tx_blocking(const_cast<uint8_t *>(d), n, 500);
+    xSemaphoreGive(g_vcp_lock);
+}
+
+// Copies line to out, removing S words if the line contains an M7 command.
+// Returns the output length.
+static size_t strip_s_from_m7(const char *line, char *out)
+{
+    bool has_m7 = false;
+    bool in_paren = false;
+    for (const char *p = line; *p; ++p) {
+        char c = *p;
+        if (in_paren) { if (c == ')') in_paren = false; continue; }
+        if (c == '(') { in_paren = true; continue; }
+        if (c == ';') break;
+        if (c == 'M' || c == 'm') {
+            char *end;
+            long v = strtol(p + 1, &end, 10);
+            if (end == p + 1) continue;
+            if (v == M_CODE_AIRASSIST) has_m7 = true;
+            p = end - 1;
+        }
+    }
+
+    size_t o = 0;
+    in_paren = false;
+    bool in_comment = false;
+    for (const char *p = line; *p; ++p) {
+        char c = *p;
+        if (!has_m7 || in_comment) { out[o++] = c; continue; }
+        if (in_paren) { out[o++] = c; if (c == ')') in_paren = false; continue; }
+        if (c == '(') { in_paren = true; out[o++] = c; continue; }
+        if (c == ';') { in_comment = true; out[o++] = c; continue; }
+        if (c == 'S' || c == 's') {
+            char *end;
+            strtod(p + 1, &end);
+            if (end != p + 1) { p = end - 1; continue; }
+        }
+        out[o++] = c;
+    }
+    out[o] = 0;
+    return o;
+}
+
+// Called with every byte block that goes client -> laser; forwards it too.
 static void gcode_feed(const uint8_t *d, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
@@ -193,19 +241,36 @@ static void gcode_feed(const uint8_t *d, size_t n)
             g_air_off_pending = false;
             outputs_off();
             gcode_reset();
+            forward_to_laser(&c, 1);
             continue;
         }
-        if (c == '?' || c == '!' || c == '~') continue;   // real-time chars
+        if (c == '?' || c == '!' || c == '~') { // real-time chars
+            forward_to_laser(&c, 1);
+            continue;
+        }
         if (c == '\n' || c == '\r') {
-            if (g_line_len && !g_line_overflow) {
+            if (g_line_overflow) {
+                // too long to filter: already flushed raw below
+            } else if (g_line_len) {
                 g_line[g_line_len] = 0;
                 handle_gcode_line(g_line);
+                char out[sizeof(g_line)];
+                size_t o = strip_s_from_m7(g_line, out);
+                forward_to_laser((const uint8_t *)out, o);
             }
+            forward_to_laser(&c, 1);
             gcode_reset();
             continue;
         }
-        if (g_line_len < sizeof(g_line) - 1) g_line[g_line_len++] = c;
-        else g_line_overflow = true;
+        if (g_line_overflow) {
+            forward_to_laser(&c, 1);
+        } else if (g_line_len < sizeof(g_line) - 1) {
+            g_line[g_line_len++] = c;
+        } else {
+            g_line_overflow = true;
+            forward_to_laser((const uint8_t *)g_line, g_line_len);
+            forward_to_laser(&c, 1);
+        }
     }
 }
 
@@ -366,12 +431,7 @@ static void tcp_server_task(void *arg)
         uint8_t buf[256];
         int n;
         while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
-            xSemaphoreTake(g_vcp_lock, portMAX_DELAY);
-            if (g_vcp) {
-                g_vcp->tx_blocking(buf, n, 500);
-            }
-            xSemaphoreGive(g_vcp_lock);
-            gcode_feed(buf, n);  
+            gcode_feed(buf, n);
         }
 
         g_client = -1;
