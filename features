@@ -1,0 +1,25 @@
+Features
+-   Bootup: Start ESP ->  Powerboard enable
+                          Keep track of board power on or off
+                          Keep track of laser state
+                          Keep track of USB connection
+                          Keep track of TCP connection
+
+
+Board power:
+- Keep track of whether the board power is on or off
+
+Laser state:
+- Keep track of whether the laser is on or off
+
+USB connection:
+- If USB connection is lost, force powerdown board
+
+TCP connection:
+- If TCP connection is lost, force M5
+
+Info:
+M3 + Svalue - set laser power on
+M4 + Svalue - set dynamic laser power with movement speed
+M5 - turn off laser
+$32=1 - laser turns off automatically when no movement is detected
