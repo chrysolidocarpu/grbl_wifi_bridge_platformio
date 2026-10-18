@@ -42,7 +42,7 @@ using namespace esp_usb;
 #define PULSE_RES_BITS   10
 #define PULSE_TARGET_DUTY_PCT 40    // M7 without S: duty reached at the end of the ramp
 #define PULSE_S_MAX      1000       // M7 Pn: n / PULSE_S_MAX = duty fraction
-#define PULSE_RAMP_MS    5000       // M7 ramp-up time
+#define PULSE_RAMP_MS    10000       // M7 ramp-up time
 #define AIR_ACTIVE_HIGH  1          // 1: GPIO high = air on
 // ---------------------------------------------------------------------------
 
@@ -157,7 +157,7 @@ static void handle_gcode_line(const char *line)
                 g_air_off_pending = false;
                 long s = find_s_word(line);
                 uint32_t pct = PULSE_TARGET_DUTY_PCT;
-                if (s >= 0) pct = (uint32_t)(s > PULSE_S_MAX ? PULSE_S_MAX : s) * 100 / PULSE_S_MAX;
+                if (s >= 0) pct = (uint32_t)(s > PULSE_S_MAX ? PULSE_S_MAX : s);
                 pulse_start(pct);
                 ESP_LOGI(TAG, "Pulsed output ramping to %u%%", (unsigned)pct);
             } else if (v == 8) {
@@ -167,6 +167,7 @@ static void handle_gcode_line(const char *line)
                 ESP_LOGI(TAG, "Pulsed output ramping to max %u%%", (unsigned)pct);
             } else if (v == 9) {
                 g_air_off_pending = true;     // switch off once GRBL is idle
+                ESP_LOGI(TAG, "Pulsed output ramping to off.");
             }
 
             p = end - 1;
