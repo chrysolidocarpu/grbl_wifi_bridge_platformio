@@ -157,7 +157,7 @@ static void handle_gcode_line(const char *line)
                 g_air_off_pending = false;
                 long s = find_s_word(line);
                 uint32_t pct = PULSE_TARGET_DUTY_PCT;
-                if (s >= 0) pct = (uint32_t)(s > PULSE_S_MAX ? PULSE_S_MAX : s) * 1000 / PULSE_S_MAX;
+                if (s >= 0) pct = (uint32_t)(s > PULSE_S_MAX ? PULSE_S_MAX : s) * 100 / PULSE_S_MAX;
                 pulse_start(pct);
                 ESP_LOGI(TAG, "Pulsed output ramping to %u%%", (unsigned)pct);
             } else if (v == 8) {
